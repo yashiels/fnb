@@ -2,15 +2,19 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/yashiels/fnb/internal/exitcode"
+	"github.com/yashiels/fnb/internal/session"
 )
 
 func TestVersionOutput(t *testing.T) {
@@ -31,12 +35,15 @@ func TestVersionOutput(t *testing.T) {
 func TestAccountsListMissingUsername(t *testing.T) {
 	t.Setenv("FNB_USERNAME", "")
 	directory := t.TempDir()
-	code, _, stderr := runCLI("--config-dir", directory, "accounts", "list")
+	code, stdout, stderr := runCLI("--json", "--config-dir", directory, "accounts", "list")
 	if code != exitcode.ExitAuthentication {
 		t.Fatalf("code = %d, stderr = %q", code, stderr)
 	}
 	if !strings.Contains(stderr, "FNB_USERNAME") {
 		t.Fatalf("stderr = %q", stderr)
+	}
+	if !strings.Contains(stdout, `"code":"configuration"`) {
+		t.Fatalf("stdout = %q", stdout)
 	}
 }
 
@@ -63,9 +70,12 @@ func TestConfigDirectorySymlink(t *testing.T) {
 	if err := os.Symlink(realDirectory, link); err != nil {
 		t.Fatal(err)
 	}
-	code, _, stderr := runCLI("--config-dir", link, "accounts", "list")
-	if code != exitcode.ExitAuthentication {
+	code, stdout, stderr := runCLI("--json", "--config-dir", link, "accounts", "list")
+	if code != exitcode.ExitUsage {
 		t.Fatalf("code = %d, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stdout, `"code":"unsafe_output_dir"`) {
+		t.Fatalf("stdout = %q", stdout)
 	}
 	if !strings.Contains(stderr, "symlink") {
 		t.Fatalf("stderr = %q", stderr)
@@ -78,9 +88,12 @@ func TestConfigDirectoryGroupWritable(t *testing.T) {
 	if err := os.Chmod(directory, 0o770); err != nil {
 		t.Fatal(err)
 	}
-	code, _, stderr := runCLI("--config-dir", directory, "accounts", "list")
-	if code != exitcode.ExitAuthentication {
+	code, stdout, stderr := runCLI("--json", "--config-dir", directory, "accounts", "list")
+	if code != exitcode.ExitUsage {
 		t.Fatalf("code = %d, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stdout, `"code":"unsafe_output_dir"`) {
+		t.Fatalf("stdout = %q", stdout)
 	}
 	if !strings.Contains(stderr, "group/world-writable") {
 		t.Fatalf("stderr = %q", stderr)
@@ -151,6 +164,14 @@ func TestUncodedCommandErrorIsGeneralError(t *testing.T) {
 	}
 }
 
+func TestConfigurationErrorPreservesCodedError(t *testing.T) {
+	app := &application{}
+	want := exitcode.New(exitcode.ExitRateLimit, "synthetic", "synthetic")
+	if got := app.configurationError(want); got != want {
+		t.Fatalf("error = %v", got)
+	}
+}
+
 func TestValidConfigReachesStub(t *testing.T) {
 	t.Setenv("FNB_USERNAME", "")
 	directory := t.TempDir()
@@ -165,6 +186,250 @@ func TestValidConfigReachesStub(t *testing.T) {
 	if !strings.Contains(stderr, "not implemented") {
 		t.Fatalf("stderr = %q", stderr)
 	}
+}
+
+type cliClock struct {
+	now time.Time
+}
+
+func (clock *cliClock) Now() time.Time {
+	return clock.now
+}
+
+func (clock *cliClock) Sleep(_ context.Context, duration time.Duration) error {
+	clock.now = clock.now.Add(duration)
+	return nil
+}
+
+func TestAuthStatusReportsAttemptRateAndSession(t *testing.T) {
+	directory := configuredDirectory(t)
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts := session.NewAttempts(root)
+	last := now.Add(-5 * time.Minute)
+	if err := attempts.SaveAttempt(session.Attempt{State: session.AttemptOK, At: last, LastCredentialLoginAt: &last}); err != nil {
+		t.Fatal(err)
+	}
+	store := session.NewStore(root, time.Hour, &cliClock{now: now})
+	if err := store.SaveSession(session.Session{CreatedAt: now.Add(-10 * time.Minute), Cookies: []session.Cookie{{Name: "session", Value: "synthetic", Secure: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	root.Close()
+	code, stdout, stderr := runConfiguredApp(directory, &cliClock{now: now}, strings.NewReader(""), false, "auth", "status")
+	if code != exitcode.ExitOK {
+		t.Fatalf("code = %d, stderr = %q", code, stderr)
+	}
+	for _, fragment := range []string{
+		`"identity": "view-only-secondary (declared, unverified)"`,
+		`"attemptState": "ok"`,
+		`"rateNextAllowedAt": "2026-09-23T12:10:00Z"`,
+		`"session": "present"`,
+		`"sessionAgeSeconds": 600`,
+	} {
+		if !strings.Contains(stdout, fragment) {
+			t.Fatalf("stdout = %q, missing %q", stdout, fragment)
+		}
+	}
+}
+
+func TestAuthLoginRunsBlockedAndRatePreflightWithoutWriting(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		state session.AttemptState
+		slug  string
+	}{
+		{"blocked", session.AttemptBlocked, "login_blocked"},
+		{"in flight", session.AttemptInFlight, "login_blocked"},
+		{"rate", session.AttemptOK, "rate_limited"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			directory := configuredDirectory(t)
+			now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+			root, err := os.OpenRoot(directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			last := now.Add(-time.Minute)
+			attempt := session.Attempt{State: testCase.state, Reason: "synthetic", At: last, LastCredentialLoginAt: &last}
+			if err := session.NewAttempts(root).SaveAttempt(attempt); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(filepath.Join(directory, session.AttemptFileName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			root.Close()
+			code, stdout, stderr := runConfiguredApp(directory, &cliClock{now: now}, strings.NewReader(""), false, "--json", "auth", "login")
+			if (testCase.slug == "rate_limited" && code != exitcode.ExitRateLimit) || (testCase.slug == "login_blocked" && code != exitcode.ExitAuthentication) {
+				t.Fatalf("code = %d, stderr = %q", code, stderr)
+			}
+			if !strings.Contains(stdout, `"code":"`+testCase.slug+`"`) {
+				t.Fatalf("stdout = %q", stdout)
+			}
+			after, err := os.ReadFile(filepath.Join(directory, session.AttemptFileName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("auth login preflight changed attempt state")
+			}
+		})
+	}
+}
+
+func TestAuthLoginWithoutGuardStateRemainsNotImplementedAndDoesNotWrite(t *testing.T) {
+	directory := configuredDirectory(t)
+	code, _, stderr := runConfiguredApp(directory, &cliClock{now: time.Unix(1000, 0)}, strings.NewReader(""), false, "auth", "login")
+	if code != exitcode.ExitGeneral || !strings.Contains(stderr, "not implemented") {
+		t.Fatalf("code = %d, stderr = %q", code, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(directory, session.AttemptFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("attempt state exists: %v", err)
+	}
+}
+
+func TestAuthClearLockoutRefusesNoInputAndNoTTY(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		args []string
+		tty  bool
+	}{
+		{"no input", []string{"--no-input", "auth", "clear-lockout"}, true},
+		{"no tty", []string{"auth", "clear-lockout"}, false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			directory := configuredDirectory(t)
+			code, stdout, _ := runConfiguredApp(directory, &cliClock{now: time.Unix(1000, 0)}, strings.NewReader("yes\n"), testCase.tty, append([]string{"--json"}, testCase.args...)...)
+			if code != exitcode.ExitUsage || !strings.Contains(stdout, `"code":"interactive_required"`) {
+				t.Fatalf("code = %d, stdout = %q", code, stdout)
+			}
+		})
+	}
+}
+
+func TestAuthClearLockoutRequiresTypedYes(t *testing.T) {
+	directory := configuredDirectory(t)
+	now := time.Unix(1000, 0)
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.NewAttempts(root).SaveAttempt(session.Attempt{State: session.AttemptBlocked, Reason: "synthetic", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	root.Close()
+	code, stdout, stderr := runConfiguredApp(directory, &cliClock{now: now}, strings.NewReader("yes\n"), true, "auth", "clear-lockout")
+	if code != exitcode.ExitOK {
+		t.Fatalf("code = %d, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stdout, `"status": "ok"`) {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	root, err = os.OpenRoot(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	attempt, found, err := session.NewAttempts(root).LoadAttempt()
+	if err != nil || !found || attempt.State != session.AttemptOK {
+		t.Fatalf("attempt = %#v, found = %v, err = %v", attempt, found, err)
+	}
+}
+
+func TestAuthLogoutDeletesOnlyLocalSession(t *testing.T) {
+	directory := configuredDirectory(t)
+	now := time.Unix(1000, 0)
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.NewStore(root, time.Hour, &cliClock{now: now}).SaveSession(session.Session{CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	root.Close()
+	code, stdout, stderr := runConfiguredApp(directory, &cliClock{now: now}, strings.NewReader(""), false, "auth", "logout")
+	if code != exitcode.ExitOK {
+		t.Fatalf("code = %d, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stdout, `"serverLogoff": "not_implemented_until_m0"`) {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(directory, session.SessionFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("session still exists: %v", err)
+	}
+}
+
+func TestPendingM2aAuthCommandsTakeLockAndRemainNotImplemented(t *testing.T) {
+	for _, args := range [][]string{{"auth", "approve"}, {"auth", "import-cookies"}} {
+		directory := configuredDirectory(t)
+		code, _, stderr := runConfiguredApp(directory, &cliClock{now: time.Unix(1000, 0)}, strings.NewReader(""), false, args...)
+		if code != exitcode.ExitGeneral || !strings.Contains(stderr, "not implemented") {
+			t.Fatalf("args = %v, code = %d, stderr = %q", args, code, stderr)
+		}
+		info, err := os.Stat(filepath.Join(directory, "lock"))
+		if err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("args = %v, lock info = %v, err = %v", args, info, err)
+		}
+	}
+}
+
+func TestConfigUsingCommandsReturnLockContention(t *testing.T) {
+	directory := configuredDirectory(t)
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	holder, err := session.AcquireLock(context.Background(), root, nil, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	for _, args := range [][]string{{"accounts", "list"}, {"transactions", "x"}, {"doctor"}} {
+		clock := &cliClock{now: time.Unix(1000, 0)}
+		code, stdout, stderr := runConfiguredAppWithTimeout(directory, clock, 200*time.Millisecond, strings.NewReader(""), false, append([]string{"--json"}, args...)...)
+		if code != exitcode.ExitRateLimit {
+			t.Fatalf("args = %v, code = %d, stderr = %q", args, code, stderr)
+		}
+		if !strings.Contains(stdout, `"code":"lock_contention"`) {
+			t.Fatalf("args = %v, stdout = %q", args, stdout)
+		}
+	}
+}
+
+func configuredDirectory(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	config := "username = \"secondary-user\"\nidentity = \"view-only-secondary\"\n"
+	if err := os.WriteFile(filepath.Join(directory, "config.toml"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return directory
+}
+
+func runConfiguredApp(directory string, clock session.Clock, stdin io.Reader, tty bool, args ...string) (int, string, string) {
+	return runConfiguredAppWithTimeout(directory, clock, time.Second, stdin, tty, args...)
+}
+
+func runConfiguredAppWithTimeout(directory string, clock session.Clock, lockTimeout time.Duration, stdin io.Reader, tty bool, args ...string) (int, string, string) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	app := &application{
+		stdin:       stdin,
+		stdout:      &stdout,
+		stderr:      &stderr,
+		clock:       clock,
+		isTTY:       func() bool { return tty },
+		lockTimeout: lockTimeout,
+		lifetime:    time.Hour,
+	}
+	root := app.rootCommand()
+	fullArgs := append([]string{"--config-dir", directory}, args...)
+	code := execute(app, root, fullArgs)
+	return code, stdout.String(), stderr.String()
 }
 
 func runCLI(args ...string) (int, string, string) {

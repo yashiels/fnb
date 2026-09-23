@@ -27,9 +27,12 @@ func testLinuxACL(t *testing.T, arguments ...string) {
 	if output, err := exec.Command("setfacl", arguments...).CombinedOutput(); err != nil {
 		t.Skipf("setfacl unavailable: %v: %s", err, output)
 	}
-	code, _, stderr := runCLI("--config-dir", directory, "accounts", "list")
-	if code != exitcode.ExitAuthentication {
+	code, stdout, stderr := runCLI("--json", "--config-dir", directory, "accounts", "list")
+	if code != exitcode.ExitUsage {
 		t.Fatalf("code = %d, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stdout, `"code":"unsafe_output_dir"`) {
+		t.Fatalf("stdout = %q", stdout)
 	}
 	if !strings.Contains(stderr, "ACL") {
 		t.Fatalf("stderr = %q", stderr)

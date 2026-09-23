@@ -291,11 +291,11 @@ type recordingFile struct {
 	operations *recordingOperations
 }
 
-func (operations *recordingOperations) checkDirectory() error {
+func (operations *recordingOperations) CheckDirectory() error {
 	return operations.record("checkDirectory")
 }
 
-func (operations *recordingOperations) openTemp(string) (fileHandle, error) {
+func (operations *recordingOperations) OpenTemp(string) (FileHandle, error) {
 	if err := operations.record("openTemp"); err != nil {
 		return nil, err
 	}
@@ -303,18 +303,18 @@ func (operations *recordingOperations) openTemp(string) (fileHandle, error) {
 	return &recordingFile{operations: operations}, nil
 }
 
-func (operations *recordingOperations) lstat(string) (os.FileInfo, error) {
+func (operations *recordingOperations) Lstat(string) (os.FileInfo, error) {
 	if err := operations.record("lstat"); err != nil {
 		return nil, err
 	}
 	return nil, os.ErrNotExist
 }
 
-func (operations *recordingOperations) link(string, string) error {
+func (operations *recordingOperations) Link(string, string) error {
 	return operations.record("link")
 }
 
-func (operations *recordingOperations) rename(string, string) error {
+func (operations *recordingOperations) Rename(string, string) error {
 	if err := operations.record("rename"); err != nil {
 		return err
 	}
@@ -322,7 +322,7 @@ func (operations *recordingOperations) rename(string, string) error {
 	return nil
 }
 
-func (operations *recordingOperations) remove(string) error {
+func (operations *recordingOperations) Remove(string) error {
 	if err := operations.record("remove"); err != nil {
 		return err
 	}
@@ -330,7 +330,7 @@ func (operations *recordingOperations) remove(string) error {
 	return nil
 }
 
-func (operations *recordingOperations) syncDirectory() error {
+func (operations *recordingOperations) SyncDirectory() error {
 	return operations.record("syncDirectory")
 }
 
