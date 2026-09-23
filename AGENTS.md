@@ -8,8 +8,11 @@
 - `internal/cli`: Cobra command tree, flags, error reporting and version wiring
 - `internal/config`: XDG paths, TOML configuration and identity validation
 - `internal/exitcode`: coded errors and exit status constants
+- `internal/guard`: closed request allowlist and redirect enforcement
 - `internal/output`: JSON, plain and table rendering
 - `internal/secure`: pinned-directory secure writes and scrubbed child environments
+- `internal/session`: login-attempt state, session persistence and config-directory locking
+- `internal/transport`: guarded, paced HTTP transport and cookie containment
 - `docs`: approved design, threat model, incident procedure and provenance
 
 ## Commands
